@@ -1,0 +1,349 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+ratio = 1
+plains = [16, 32, 64, 128, 256]
+filters = [f * ratio for f in plains]
+
+__all__ = [
+    "FRCNetS"
+]
+
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channel, r=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # GAP
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // r, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Squeeze  [N, C, 1, 1] -->view [N, C]
+        y = self.avg_pool(x).view(b, c)
+        # Excitation
+        y = self.fc(y).view(b, c, 1, 1)
+        # Fusion
+        y = torch.mul(x, y)
+        return y
+
+
+class MPA(nn.Module):
+    def __init__(self, filters):
+        super(MPA, self).__init__()
+        self.levels = nn.ModuleList([self._conv_1x1(f_in, filters[0]) for f_in in filters[1:]])
+        self.conv_out = nn.Sequential(
+            nn.Conv2d(filters[0] * len(filters), filters[0], kernel_size=1, bias=False),
+            nn.BatchNorm2d(filters[0]),
+            SEBlock(filters[0]),
+        )
+
+    @classmethod
+    def _conv_1x1(cls, in_channels, out_channels):
+        conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        bn = nn.BatchNorm2d(out_channels)
+        return nn.Sequential(conv, bn)
+
+    def forward(self, features):
+        feature_list = [self.levels[i](f) for i, f in enumerate(features[1:])]
+        _, _, h, w = features[0].size()
+        feature_outs = [F.upsample(input=f, size=(h, w), mode='bilinear') for f in feature_list]
+        feature_outs = [features[0]] + feature_outs
+        feature_outs = torch.cat(feature_outs, dim=1)
+        return self.conv_out(feature_outs)
+
+
+class GlobalContextBlock(nn.Module):
+    def __init__(self,
+                 inplanes,
+                 ratio,
+                 pooling_type='att',
+                 fusion_types=('channel_add',)):
+        super(GlobalContextBlock, self).__init__()
+        assert pooling_type in ['avg', 'att']
+        assert isinstance(fusion_types, (list, tuple))
+        valid_fusion_types = ['channel_add', 'channel_mul']
+        assert all([f in valid_fusion_types for f in fusion_types])
+        assert len(fusion_types) > 0, 'at least one fusion should be used'
+        self.inplanes = inplanes
+        self.ratio = ratio
+        self.planes = int(inplanes * ratio)
+        self.pooling_type = pooling_type
+        self.fusion_types = fusion_types
+        if pooling_type == 'att':
+            self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
+            self.softmax = nn.Softmax(dim=2)
+        else:
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        if 'channel_add' in fusion_types:
+            self.channel_add_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),  # yapf: disable
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1))
+        else:
+            self.channel_add_conv = None
+        if 'channel_mul' in fusion_types:
+            self.channel_mul_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),  # yapf: disable
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1))
+        else:
+            self.channel_mul_conv = None
+
+    def spatial_pool(self, x):
+        batch, channel, height, width = x.size()
+        if self.pooling_type == 'att':
+            input_x = x
+            # [N, C, H * W]
+            input_x = input_x.view(batch, channel, height * width)
+            # [N, 1, C, H * W]
+            input_x = input_x.unsqueeze(1)
+            # [N, 1, H, W]
+            context_mask = self.conv_mask(x)
+            # [N, 1, H * W]
+            context_mask = context_mask.view(batch, 1, height * width)
+            # [N, 1, H * W]
+            context_mask = self.softmax(context_mask)
+            # [N, 1, H * W, 1]
+            context_mask = context_mask.unsqueeze(-1)
+            # [N, 1, C, 1]
+            context = torch.matmul(input_x, context_mask)
+            # [N, C, 1, 1]
+            context = context.view(batch, channel, 1, 1)
+        else:
+            # [N, C, 1, 1]
+            context = self.avg_pool(x)  # 全局平均池化
+
+        return context
+
+    def forward(self, x):
+        # [N, C, 1, 1]
+        context = self.spatial_pool(x)
+
+        out = x
+        if self.channel_mul_conv:
+            # [N, C, 1, 1]
+            channel_mul_term = torch.sigmoid(self.channel_mul_conv(context))
+            out = out * channel_mul_term
+        if self.channel_add_conv is not None:
+            # [N, C, 1, 1]
+            channel_add_term = self.channel_add_conv(context)
+            out = out + channel_add_term
+
+        return out
+
+
+class ProgressiveContextAwareFusionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation_rate=(3,), ratio=0.5, residual=False):
+        super().__init__()
+        self.residual = residual
+        tmp_ch = out_channels // 2
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(in_channels, tmp_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(tmp_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.local_conv = nn.Conv2d(
+            tmp_ch, tmp_ch, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=False
+        )
+        self.surrounding_conv = nn.ModuleList([
+            nn.Conv2d(
+                tmp_ch, tmp_ch, kernel_size=3, stride=1, padding=d, dilation=d, groups=1, bias=False
+            ) for d in dilation_rate
+        ])
+        self.bn_relu = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.global_conv = GlobalContextBlock(inplanes=out_channels, ratio=ratio)
+
+    def forward(self, x):
+        f = self.conv1x1(x)
+        local_feature = self.local_conv(f)
+        surrounding_feature = [func(f) for func in self.surrounding_conv]
+        join_feature = self.bn_relu(torch.cat([local_feature] + surrounding_feature, dim=1))
+        global_feature = self.global_conv(join_feature)
+
+        if self.residual:
+            output = global_feature + x
+        else:
+            output = global_feature
+        return output
+
+
+class DSC(nn.Module):
+    """
+    DepthWise Separable Convolution
+    """
+
+    def __init__(self, inplanes, planes):
+        super(DSC, self).__init__()
+        self.dsc = nn.Sequential(
+            nn.Conv2d(inplanes, inplanes, kernel_size=3, padding=1, groups=inplanes, bias=False),
+            nn.BatchNorm2d(inplanes),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, padding=0, bias=False),
+        )
+
+    def forward(self, x):
+        x = self.dsc(x)
+        return x
+
+
+class CCM(nn.Module):
+    """ Context Calibration Module """
+
+    def __init__(self, planes, pool_rate=2, pool_mode='avg'):
+        super(CCM, self).__init__()
+        if pool_mode == 'avg':
+            Downsampling = nn.AvgPool2d(kernel_size=pool_rate, stride=pool_rate)
+        elif pool_mode == 'max':
+            Downsampling = nn.MaxPool2d(kernel_size=pool_rate, stride=pool_rate)
+        else:
+            Downsampling = None
+            print("Please check again the pool_mode!")
+            exit(0)
+
+        self.conv1 = nn.Sequential(
+            Downsampling,
+            DSC(planes, planes),
+        )
+
+        self.conv2 = DSC(planes, planes)
+        self.conv3 = nn.Conv2d(planes, planes, kernel_size=1, padding=0, bias=False)
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = F.interpolate(x, residual.size()[2:])  # identity.size()[2:] = (h, w)
+        x = torch.add(x, residual)
+        x = torch.sigmoid(x)
+        y = self.conv2(residual)
+        z = torch.mul(x, y)
+        out = self.conv3(z)
+        return out
+
+
+class ECConv(nn.Module):
+    """Enhanced Context Calibration Conv """
+
+    def __init__(self, in_channels, out_channels, pool_rate=4, pool_mode='avg'):
+        super(ECConv, self).__init__()
+        self.k0 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels // 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels // 2)
+        )
+        self.k1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels // 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels // 2)
+        )
+        self.k2 = CCM(out_channels // 2, pool_rate=pool_rate, pool_mode=pool_mode)
+        self.k3 = DSC(out_channels // 2, out_channels // 2)
+        self.k4 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = self.k4(x)
+
+        part_1 = self.k0(x)
+        part_2 = self.k1(x)
+
+        p1 = self.relu(part_1)
+        p2 = self.relu(part_2)
+
+        p1 = self.k2(p1)  # (n, c_out//2, h, w)
+        p2 = self.k3(p2)
+
+        p1 = self.relu(p1)
+        p2 = self.relu(p2)
+
+        out = torch.cat([p1, p2], dim=1)  # [N, C, H, W]
+        out = torch.add(residual, out)
+        out = self.relu(out)
+        return out
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+        self.conv1 = ECConv(in_channels, in_channels // 4)
+
+        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4, kernel_size=4, stride=2, padding=1, bias=False)
+        self.norm2 = nn.BatchNorm2d(in_channels // 4)
+        self.relu2 = nn.ReLU(inplace=True)
+
+        self.conv3 = ECConv(in_channels // 4, out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.deconv2(x)
+        x = self.norm2(x)
+        x = self.relu2(x)
+        x = self.conv3(x)
+        return x
+
+
+class FRCNetS(nn.Module):
+    def __init__(self, n_channels=3, n_classes=1):
+        super(FRCNetS, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.up = nn.Upsample(scale_factor=2)
+        self.down = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.encoder_1 = ECConv(n_channels, filters[0])
+        self.encoder_2 = ECConv(filters[0], filters[1])
+        self.encoder_3 = ECConv(filters[1], filters[2])
+        self.encoder_4 = ECConv(filters[2], filters[3])
+        self.encoder_5 = ECConv(filters[3], filters[4])
+
+        self.pcg = ProgressiveContextAwareFusionBlock(filters[4], filters[4])
+
+        self.decoder_4 = DecoderBlock(filters[4], filters[3])
+        self.decoder_3 = DecoderBlock(filters[3], filters[2])
+        self.decoder_2 = DecoderBlock(filters[2], filters[1])
+        self.decoder_1 = DecoderBlock(filters[1], filters[0])
+
+        self.apf = MPA(filters)
+
+        self.final_conv = nn.Conv2d(filters[0], n_classes, kernel_size=1, padding=0)
+
+    def forward(self, x):
+        e1 = self.encoder_1(x)
+
+        e2 = self.down(e1)
+        e2 = self.encoder_2(e2)
+
+        e3 = self.down(e2)
+        e3 = self.encoder_3(e3)
+
+        e4 = self.down(e3)
+        e4 = self.encoder_4(e4)
+
+        e5 = self.down(e4)
+        e5 = self.encoder_5(e5)
+
+        e5 = self.pcf(e5)
+
+        d4 = self.decoder_4(e5) + e4
+        d3 = self.decoder_3(d4) + e3
+        d2 = self.decoder_2(d3) + e2
+        d1 = self.decoder_1(d2) + e1
+
+        d0 = self.mpa([d1, d2, d3, d4, e5])
+
+        out = self.final_conv(d0)
+
+        return out
